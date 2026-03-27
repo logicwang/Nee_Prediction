@@ -356,7 +356,7 @@ net = Informer.Model(config).to(device)
 
 criterion = nn.MSELoss().to(device)  # 损失函数
 optimizer = optim.Adam(net.parameters(), lr=learning_rate)  # 优化器
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=scheduler_patience, verbose=True)  # 学习率调整策略
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=scheduler_patience)  # 学习率调整策略
 
 trained_model, train_loss, final_epoch = model_train(net, train_loader, length_size, optimizer, criterion, num_epochs,
                                                      device, print_train=True)
@@ -377,9 +377,18 @@ trained_model, train_loss, val_loss, final_epoch = model_train_val(
 """
 trained_model.eval()  # 模型转换为验证模式
 # 预测并调整维度
-pred = trained_model(x_test.to(device), x_test_mark.to(device), y_test.to(device), y_test_mark.to(device))
-true = y_test[:, -length_size:, -1:].detach().cpu()
-pred = pred.detach().cpu()
+preds = []
+trues = []
+with torch.no_grad():
+    for x, y, x_mark, y_mark in test_loader:
+        x, y, x_mark, y_mark = x.to(device), y.to(device), x_mark.to(device), y_mark.to(device)
+        outputs = trained_model(x, x_mark, y, y_mark)
+        preds.append(outputs.detach().cpu().numpy())
+        trues.append(y[:, -length_size:, -1:].detach().cpu().numpy())
+
+pred = np.concatenate(preds, axis=0)
+true = np.concatenate(trues, axis=0)
+
 # 检查pred和true的维度并调整
 print("Shape of true before adjustment:", true.shape)
 print("Shape of pred before adjustment:", pred.shape)
