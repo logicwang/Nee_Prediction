@@ -7,10 +7,12 @@ from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
+from tqdm import tqdm
 
 import torch
-
+import sys
 print(torch.__version__)
+sys.stdout.flush()
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -53,8 +55,18 @@ def tslib_data_loader(window, length_size, batch_size, data, data_mark):
     # 构建模型的输入
     seq_len = window
     sequence_length = seq_len + length_size
-    result = np.array([data[i: i + sequence_length] for i in range(len(data) - sequence_length + 1)])
-    result_mark = np.array([data_mark[i: i + sequence_length] for i in range(len(data) - sequence_length + 1)])
+    num_samples = len(data) - sequence_length + 1
+    print(f"TSLIB data generator start, seq_len: {seq_len}, length_size: {length_size}, total samples: {num_samples}")
+    
+    # 使用预分配空间代替列表推导式，极大提升大切片场景下的性能
+    result = np.empty((num_samples, sequence_length, data.shape[1]), dtype=np.float32)
+    result_mark = np.empty((num_samples, sequence_length, data_mark.shape[1]), dtype=np.float32)
+    
+    for i in range(num_samples):
+        result[i] = data[i : i + sequence_length]
+        result_mark[i] = data_mark[i : i + sequence_length]
+        
+    print("TSLIB window splicing finished...")
 
     # 划分x与y
     x_temp = result[:, :-length_size]
@@ -95,13 +107,14 @@ def model_train(net, train_loader, length_size, optimizer, criterion, num_epochs
     """
 
     train_loss = []  # 用于记录每个epoch的平均训练损失
-    print_frequency = num_epochs / 20  # 计算打印训练状态的频率
+    print_frequency = 1 #num_epochs / 20  # 计算打印训练状态的频率
 
     for epoch in range(num_epochs):
         total_train_loss = 0  # 初始化一个epoch的总损失
 
         net.train()  # 将模型设置为训练模式
-        for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(train_loader):
+        loop = tqdm(train_loader, total=len(train_loader), leave=True, desc=f"Epoch [{epoch+1}/{num_epochs}]")
+        for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(loop):
             datapoints, labels, datapoints_mark, labels_mark = datapoints.to(device), labels.to(
                 device), datapoints_mark.to(device), labels_mark.to(device)
             optimizer.zero_grad()  # 清空梯度
@@ -112,6 +125,7 @@ def model_train(net, train_loader, length_size, optimizer, criterion, num_epochs
             loss.backward()  # 反向传播
             optimizer.step()  # 更新模型参数
             total_train_loss += loss.item()  # 累加损失值
+            loop.set_postfix(loss=loss.item())
 
         avg_train_loss = total_train_loss / len(train_loader)  # 计算该epoch的平均损失
         train_loss.append(avg_train_loss)  # 将平均损失添加到列表中
@@ -149,7 +163,7 @@ def model_train_val(net, train_loader, val_loader, length_size, optimizer, crite
 
     train_loss = []  # 用于记录每个epoch的平均损失
     val_loss = []  # 用于记录验证集上的损失，用于早停判断
-    print_frequency = num_epochs / 20  # 计算打印频率
+    print_frequency = 1 #num_epochs / 20  # 计算打印频率
 
     early_patience_epochs = int(early_patience * num_epochs)  # 早停耐心值（转换为epoch数）
     best_val_loss = float('inf')  # 初始化最佳验证集损失
@@ -159,7 +173,8 @@ def model_train_val(net, train_loader, val_loader, length_size, optimizer, crite
         total_train_loss = 0  # 初始化一个epoch的总损失
 
         net.train()  # 将模型设置为训练模式
-        for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(train_loader):
+        loop = tqdm(train_loader, total=len(train_loader), leave=True, desc=f"Epoch [{epoch+1}/{num_epochs}]")
+        for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(loop):
             datapoints, labels, datapoints_mark, labels_mark = datapoints.to(
                 device), labels.to(device), datapoints_mark.to(device), labels_mark.to(device)
             optimizer.zero_grad()  # 清空梯度
@@ -170,6 +185,7 @@ def model_train_val(net, train_loader, val_loader, length_size, optimizer, crite
             loss.backward()  # 反向传播
             optimizer.step()  # 更新模型参数
             total_train_loss += loss.item()  # 累加损失值
+            loop.set_postfix(loss=loss.item())
 
         avg_train_loss = total_train_loss / len(train_loader)  # 计算本epoch的平均损失
         train_loss.append(avg_train_loss)  # 记录平均损失
@@ -239,91 +255,128 @@ def cal_eval(y_real, y_pred):
     return df_eval
 
 
-#df = pd.read_csv('data\\禹城数据（05年-10年）.csv')
-df = pd.read_csv('data\\change_data\\smear_original_freq_processed.csv')
+def data_cleansing(df):
+    """集成自 data_preprocessing.py 的清洗逻辑，兼容多个数据集"""
+    # 确保日期格式正确并排序
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values(by='date').reset_index(drop=True)
+    
+    # 记录原始列，排除日期列进行插值
+    cols = [c for c in df.columns if c != 'date']
+    
+    # 1. 线性插值处理短时间缺失 (Limit = 6, 即 3 小时)
+    df[cols] = df[cols].interpolate(method='linear', limit=6)
+    
+    # 2. 基于时间的插值处理中等时间缺失 (Limit = 48, 即 24 小时)
+    if 'date' in df.columns:
+        df.set_index('date', inplace=True)
+        df[cols] = df[cols].interpolate(method='time', limit=48)
+        df.reset_index(inplace=True)
+    
+    # 3. 前后填充处理剩余的长期缺失
+    df[cols] = df[cols].ffill().bfill()
+    
+    return df
+
+
+# 读取数据 - 切换到长江三角洲 DT 农田数据集（30分钟级）
+data_path = 'data/Yangtze River Delta of China/DT_NEE_建模最终数据(2014年12月1日–2017年11月30日).csv'
+print(f"开始读取数据集: {data_path} ...")
+df_raw = pd.read_csv(data_path)
+print(f"数据读取完成, 原始形状: {df_raw.shape}")
+
+# 执行统一清洗
+df = data_cleansing(df_raw)
+print(f"数据清洗完成, 清洗后形状: {df.shape}")
+
+# 统一目标列名，适应原代码逻辑
+if 'Target' in df.columns:
+    df.rename(columns={'Target': 'target'}, inplace=True)
 
 # --- 方向 A 优化：特征工程 (Feature Engineering) ---
-# 1. 滞后项 (Lagged Features): 捕捉生态滞后响应
-#for col in ['PAR', 'DA_TAC', 'L1-VWC']:
-for col in ['PAR', 'AirTemp', 'SoilWatCont']:
+# 1. 滞后项 (Lagged Features): 捕捉生态滞后响应 (根据新数据集字段 K↓(辐射), Tair(温度), VPD(湿度差))
+for col in ['K↓', 'Tair', 'VPD']:
     for lag in range(1, 4):
         df[f'{col}_lag{lag}'] = df[col].shift(lag)
 
 # 2. 差分项 (Differential Features): 捕捉环境突变速度
-#for col in ['PAR', 'DA_TAC']:
-for col in ['PAR', 'AirTemp']:
+for col in ['K↓', 'Tair']:
     df[f'{col}_diff'] = df[col].diff()
+print("特征工程完成(滞后+差分)...")
 
 # 3. 清理 NaN (由于 shift 和 diff 产生)
 df.dropna(inplace=True)
+df.reset_index(drop=True, inplace=True) # 必须重置索引以保证后续矩阵拼接的对齐
 
-# 4. 重新排列列顺序：确保目标变量 'target' 始终在最后一列
+# 提取特征和目标变量
 feature_cols = [c for c in df.columns if c not in ['date', 'target']]
-df = df[['date'] + feature_cols + ['target']]
+data_target = df[['target']].values  # shape: (N, 1)
+features = df[feature_cols].values   # shape: (N, num_features)
 
-# 注意多变量情况下，目标变量必须为最后一列
-data_target = df['target']  # 预测的目标变量
-features = df[feature_cols] # 提取特征列
+print("特征和目标变量提取完成，准备时间特征编码...")
+# 时间戳特征提取 (30分钟数据，频率必须是 'h' 或 't' 以捕捉昼夜节律)
+df_stamp = df[['date']].copy()
+df_stamp['date'] = pd.to_datetime(df_stamp['date'])
+data_stamp = time_features(df_stamp, timeenc=1, freq='h')
+print("时间特征编码完成...")
 
-# --- 方向 B 优化：PCA 降维去噪 (PCA Denoising) ---
-# 1. 标准化 (Standardization): PCA 前必须进行标准化
+# ==========================================
+# --- 核心修复：防止数据泄露 (Data Leakage) ---
+# **绝对要求：必须在调用任何 .fit() 之前切分训练集与测试集**
+# ==========================================
+data_length = len(df)
+train_set = 0.8  # 保留 80% 训练集, 20% 测试集
+train_size = int(train_set * data_length)
+
+features_train = features[:train_size, :]
+features_test = features[train_size:, :]
+target_train = data_target[:train_size, :]
+target_test = data_target[train_size:, :]
+data_stamp_train = data_stamp[:train_size, :]
+data_stamp_test = data_stamp[train_size:, :]
+print("训练/测试集切分完成...")
+
+# --- 方向 B 优化 (隔离模式)：PCA 降维去噪 ---
+# 1. StandardScaler：【只对训练集 fitting，不对测试集学习参数】
+print("开始进行数据标准化与 PCA 降维...")
 scaler_pca = StandardScaler()
-features_scaled = scaler_pca.fit_transform(features)
+features_train_scaled = scaler_pca.fit_transform(features_train)
+features_test_scaled = scaler_pca.transform(features_test) 
 
-# 2. 应用 PCA: 保留 95% 的方差，消除特征间的共线性
+# 2. PCA降维：【同样，PCA 主成分网络绝不泄露给测试集】
 pca = PCA(n_components=0.95) 
-features_pca = pca.fit_transform(features_scaled)
-print(f"PCA 降维完成：特征维度从 {features.shape[1]} 降至 {features_pca.shape[1]}")
+features_train_pca = pca.fit_transform(features_train_scaled)
+features_test_pca = pca.transform(features_test_scaled)    
+print(f"PCA 降维完成：特征维度从 {features_train.shape[1]} 降至 {features_train_pca.shape[1]}")
 
-# 3. 合并 PCA 特征与目标变量
-data_pca = np.hstack((features_pca, data_target.values.reshape(-1, 1)))
-data = pd.DataFrame(data_pca)
+# 3. 将 PCA 过滤后的特征和原本的目标变量重新拼接成网络期待的输入矩阵
+print("进行矩阵拼接与 MinMaxScaler 归一化...")
+data_train_raw = np.concatenate((features_train_pca, target_train), axis=1)
+data_test_raw = np.concatenate((features_test_pca, target_test), axis=1)
 
-data_dim = data.shape[1]  # 动态更新变量总数 (主成分数 + 1个目标变量)
-data_target = data.iloc[:, -1]  # 更新目标变量引用
-
-# 时间戳
-df_stamp = df[['date']]
-df_stamp['date'] = pd.to_datetime(df_stamp.date)
-#data_stamp = time_features(df_stamp, timeenc=1, freq='B')  # 这一步很关键，注意数据的freq
-data_stamp = time_features(df_stamp, timeenc=1, freq='t')  # 这一步很关键，注意数据的freq
-"""
-The following frequencies are supported:
-    Y   - yearly
-        alias: A
-    M   - monthly
-    W   - weekly
-    D   - daily
-    B   - business days
-    H   - hourly
-    T   - minutely
-        alias: min
-    S   - secondly
-"""
-# # 无验证集
-
-# # 数据归一化
+# --- 最终层隔离优化 ---
+# 4. MinMaxScaler 归一化网络整体输入：【全局绝对极值必须局限于训练集】
 scaler = MinMaxScaler()
-data_inverse = scaler.fit_transform(np.array(data))
+data_train = scaler.fit_transform(data_train_raw)
+data_test = scaler.transform(data_test_raw)           
 
-data_length = len(data_inverse)
-train_set = 0.8
-
-data_train = data_inverse[:int(train_set * data_length), :]  # 读取目标数据，第一列记为0：1，后面以此类推, 训练集和验证集，如果是多维输入的话最后一列为目标列数据
-data_train_mark = data_stamp[:int(train_set * data_length), :]
-data_test = data_inverse[int(train_set * data_length):, :]  # 这里把训练集和测试集分开了，也可以换成两个csv文件
-data_test_mark = data_stamp[int(train_set * data_length):, :]
+data_train_mark = data_stamp_train
+data_test_mark = data_stamp_test
+data_dim = data_train.shape[1]  # 特征维度 (PCA维数) + 1 个目标维度
 
 n_feature = data_dim
-#window = 20  # 模型输入序列长度 (从 10 增加到 20 以增强历史背景感知)
-window = 60
-length_size = 1  # 预测结果的序列长度
-batch_size = 32
+window = 96  # 输入序列: 过去 2 天的半小时数据 (48 * 2)
+length_size = 48  # 预测未来的序列长度: 未来 1 天 (48 * 1)
+batch_size = 128
 
+print("准备封装 PyTorch DataLoader...")
 train_loader, x_train, y_train, x_train_mark, y_train_mark = tslib_data_loader(window, length_size, batch_size,
                                                                                data_train, data_train_mark)
+print("训练集 DataLoader 封装完成...")
 test_loader, x_test, y_test, x_test_mark, y_test_mark = tslib_data_loader(window, length_size, batch_size, data_test,
                                                                           data_test_mark)
+print("测试集 DataLoader 封装完成...")
 """
 # 有验证集
 
@@ -367,7 +420,7 @@ class Config:
         self.label_len = int(window / 2)  # 标签序列长度
         self.pred_len = length_size  # 预测序列长度
         #self.freq = 'b'  # 时间的频率，
-        self.freq = 't'  # 时间的频率，
+        self.freq = 'h'  # 切换为小时级别频率，适配半小时高频数据
         # 模型训练
         self.batch_size = batch_size  # 批次大小
         self.num_epochs = num_epochs  # 训练的轮数
@@ -404,7 +457,7 @@ net = TCNInformer.Model(config).to(device)
 
 criterion = nn.MSELoss().to(device)  # 损失函数 (回归 MSE 以保证波峰捕捉力度)
 optimizer = optim.Adam(net.parameters(), lr=learning_rate)  # 优化器
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=scheduler_patience, verbose=True)  # 学习率调整策略
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=scheduler_patience)  # 学习率调整策略
 
 trained_model, train_loss, final_epoch = model_train(net, train_loader, length_size, optimizer, criterion, num_epochs,
                                                      device, print_train=True)
@@ -427,9 +480,18 @@ trained_model, train_loss, val_loss, final_epoch = model_train_val(
 
 trained_model.eval()  # 模型转换为验证模式
 # 预测并调整维度
-pred = trained_model(x_test.to(device), x_test_mark.to(device), y_test.to(device), y_test_mark.to(device))
-true = y_test[:, -length_size:, -1:].detach().cpu()
-pred = pred.detach().cpu()
+preds = []
+trues = []
+with torch.no_grad():
+    for x, y, x_mark, y_mark in test_loader:
+        x, y, x_mark, y_mark = x.to(device), y.to(device), x_mark.to(device), y_mark.to(device)
+        outputs = trained_model(x, x_mark, y, y_mark)
+        preds.append(outputs.detach().cpu().numpy())
+        trues.append(y[:, -length_size:, -1:].detach().cpu().numpy())
+
+pred = np.concatenate(preds, axis=0)
+true = np.concatenate(trues, axis=0)
+
 # 检查pred和true的维度并调整
 print("Shape of true before adjustment:", true.shape)
 print("Shape of pred before adjustment:", pred.shape)
