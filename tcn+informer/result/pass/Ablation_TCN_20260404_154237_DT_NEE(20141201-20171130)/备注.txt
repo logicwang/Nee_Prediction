@@ -1,0 +1,72 @@
+“在相同的 3 层结构下，纯 TCN 模型的 $R^2$ 显著低于 Informer（0.39 vs 0.81）。分析表明，TCN 受到卷积核尺寸与扩张率的限制，其有效感受野仅覆盖 14.5 小时的历史数据，无法捕捉碳通量预测中至关重要的 24 小时周期性节律。而混合模型通过引入 Informer 的全局注意力机制，成功弥补了 TCN 的这一架构缺陷。”
+三层TCN，
+e_layers = 3
+
+
+物理意义：
+NEE（碳通量）具有极强的昼夜节律。要准确预测明天的 NEE，模型必须能看到昨天同一时间的数据（即至少 48 步之前）。
+
+Informer：直接通过 Attention 看到 48 步、96 步前的数据 -> R 
+2
+  0.81。
+
+TCN (3层)：只能看到过去 14.5 小时的数据，它甚至不知道昨天这个时候发生了什么 -> R 
+2
+  0.39。
+
+
+
+
+第一部分：修改模型感受野 (提升 TCN 的“眼界”)修改位置： main_ablation_tcn.py 中的 Config 类。修改原因： 30 分钟步长下，24 小时等于 48 个步长。3 层 TCN 的感受野只有 29，它甚至看不到昨天同一时刻的数据。增加到 5 层 后，感受野变为 $1 + 2 \times 2 \times (2^5 - 1) = 125$，能完整覆盖 96 个历史步长。Python# --- 修改 Config 类 ---
+class Config:
+    def __init__(self):
+        self.enc_in = data_dim
+        self.dec_in = data_dim
+        self.c_out = 1
+        self.pred_len = length_size
+
+        # 核心参数调整
+        self.d_model = 64
+        self.e_layers = 5      # 【修改点】从 3 改为 5，对齐 96 的窗口感受野
+        self.dropout = 0.1
+        
+        self.task_name = 'short_term_forecast'
+第二部分：修改反归一化与评估逻辑 (确保“尺子”精准)修改位置： main_ablation_tcn.py 的预测与保存环节（trained_model.eval() 之后）。修改原因： 确保只提取 48 步预测中的最后一步点对点对比，并进行强制维度转换，防止 Scaler 报错。Python# --- 修改预测、反归一化及评估部分 ---
+trained_model.eval()
+preds = []
+trues = []
+with torch.no_grad():
+    for x, y, x_mark, y_mark in test_loader:
+        x, y, x_mark, y_mark = x.to(device), y.to(device), x_mark.to(device), y_mark.to(device)
+        outputs = trained_model(x, x_mark, y, y_mark)
+        # 获取全部预测结果
+        preds.append(outputs.detach().cpu().numpy())
+        # 获取全部真实结果 (取最后目标列)
+        trues.append(y[:, -length_size:, -1:].detach().cpu().numpy())
+
+# 合并所有 Batch
+# 形状应为 [样本数, 48, 1]
+full_pred = np.concatenate(preds, axis=0)
+full_true = np.concatenate(trues, axis=0)
+
+# 【关键修改】只取预测序列的最后一个时间点进行评估 (对齐单步预测逻辑)
+# 形状变为 [样本数, 1]
+final_pred_point = full_pred[:, -1, :].reshape(-1, 1)
+final_true_point = full_true[:, -1, :].reshape(-1, 1)
+
+# 使用目标列的 Scaler 进行反归一化
+target_scaler = MinMaxScaler()
+target_scaler.fit(data_target) 
+
+pred_uninverse = target_scaler.inverse_transform(final_pred_point)
+true_uninverse = target_scaler.inverse_transform(final_true_point)
+
+# 计算指标
+df_eval = cal_eval(true_uninverse, pred_uninverse)
+print("\n--- 修正后的评估结果 ---")
+print(df_eval)
+
+# 更新绘图数据 (使用反归一化后的展平数据)
+true_plot = true_uninverse.flatten()
+pred_plot = pred_uninverse.flatten()
+💡 为什么这样改完就能看出差别？5 层 TCN 解决了“看不见昨天”的硬件缺陷。如果 $R^2$ 依然只有 0.4 左右，说明这个数据集确实是 Transformer 强依赖型（即 Attention 远比卷积重要）。维度重塑 (reshape(-1, 1)) 保证了 Scaler 在处理数据时不会因为维度模糊（比如把 (48,) 当成 48 个特征）而导致反归一化数值错乱。
